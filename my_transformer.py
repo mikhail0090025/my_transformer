@@ -8,14 +8,14 @@ from sklearn.model_selection import train_test_split
 class EmbeddingsLayer(nn.Module):
     def __init__(self, embeddings_size, vocabulary_size):
         super(EmbeddingsLayer, self).__init__()
-        # Инициализация матрицы эмбеддингов с нормальной инициализацией
-        self.embeddings = nn.Parameter(torch.empty((vocabulary_size, embeddings_size), dtype=torch.float32))
-        nn.init.xavier_uniform_(self.embeddings)  # Лучшая инициализация
+        embeddings = torch.zeros((vocabulary_size, embeddings_size), dtype=torch.float32)
+        nn.init.xavier_uniform_(embeddings[1:])
+        self.embeddings = nn.Parameter(embeddings)
 
     def forward(self, x):
         # x — тензор индексов токенов (batch_size, seq_length)
-        # x = x[torch.nonzero(x)]
-        return self.embeddings[x]
+        mask = (x != 0).float()
+        return self.embeddings[x], mask
 
 class SelfAttention(nn.Module):
     def __init__(self, embeddings_size):
@@ -40,34 +40,8 @@ class SelfAttention(nn.Module):
 
         return output
 
-# class SelfAttention(nn.Module):
-#     def __init__(self, embeddings_size):
-#         super(SelfAttention, self).__init__()
-#         self.w = nn.Linear(embeddings_size * 2, 1)
-#         self.softmax = nn.Softmax()
-#     
-#     def forward(self, x):
-#         # (batch_size, embeddings count, embeddings size)
-#         if len(x.shape) == 2:
-#             x = torch.tensor(np.array([x.detach().numpy()]))
-#         batch_size = x.shape[0]
-#         embeddings_count = x.shape[1]
-#         multipliers = torch.zeros((batch_size, embeddings_count, embeddings_count))
-#         new_embeddings = torch.zeros_like(x)
-#         for ii, xx in enumerate(x):
-#             for i, emb1 in enumerate(xx):
-#                 for j, emb2 in enumerate(xx):
-#                     inp = torch.cat((emb1, emb2), dim=0)
-#                     w = self.w(inp)
-#                     multipliers[ii][i][j] = w
-#                     new_embeddings[ii][i] = new_embeddings[ii][i] + (w * emb2)
-#                 multipliers[ii][i] = self.softmax(multipliers[ii][i])
-#         output = new_embeddings
-#         
-#         return output
-
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embeddings_size, heads_count=3):
+    def __init__(self, embeddings_size, heads_count=2):
         super(MultiHeadSelfAttention, self).__init__()
         self.all_sa = nn.ModuleList([SelfAttention(embeddings_size) for _ in range(heads_count)])
         self.final_layer = nn.Linear(embeddings_size * heads_count, embeddings_size)
@@ -76,16 +50,58 @@ class MultiHeadSelfAttention(nn.Module):
     
     def forward(self, x):
         # (batch_size, embeddings count, embeddings size)
-        initial_embeddings = x.clone()
-        embeddings_count = x.shape[1]
-        all_heads = torch.tensor(np.array([]), dtype=torch.float32)
-        for head in self.all_sa:
-            all_heads = torch.cat((all_heads, head(x)), dim=2)
-        
-        output = self.final_layer(all_heads)
-        output += initial_embeddings
+        x, mask = x
+        batch_size = x.shape[0]
+        mask = mask.bool()
+        result = []
+        full_size = x.shape[1]
+        for i, current_embeddings in enumerate(x):
+            current_mask = mask[i]
+            real_embeddings = current_embeddings[current_mask]
+            initial_embeddings = real_embeddings.clone()
+            all_heads = torch.tensor(np.array([]), dtype=torch.float32)
+            for head in self.all_sa:
+                attentioned = head(real_embeddings.unsqueeze(0))
+                all_heads = torch.cat((all_heads, head(attentioned)), dim=2)
+            output = self.final_layer(all_heads)
+            output += initial_embeddings
+            padding = torch.zeros((1, full_size - output.shape[1], self.embeddings_size))
+            output = torch.cat((output, padding), dim=1)
+            result.append(output.squeeze(0))
+        if len(result) == 1:
+            output = result[0].unsqueeze(0)
+        else:
+            output = torch.stack(result, dim=0)
         
         return output
+
+'''
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embeddings_size, heads_count=3):
+        super(MultiHeadSelfAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(embeddings_size, heads_count)
+        self.final_layer = nn.Linear(embeddings_size, embeddings_size)
+
+    def forward(self, x):
+        embeddings, mask = x
+        print("Embeddings: ", embeddings.shape)
+        print("Mask: ", mask.shape)
+        batch_size, seq_length, embeddings_size = embeddings.size()
+
+        # Переставляем размерности: (seq_length, batch_size, embeddings_size)
+        embeddings = embeddings.transpose(0, 1)
+        # attn_mask = (mask == 0).transpose(0, 1)
+        attn_mask = (mask == 0)
+        print("Attention mask: ", attn_mask.shape)
+
+        # Вычисляем внимание
+        output, _ = self.attention(embeddings, embeddings, embeddings, key_padding_mask=attn_mask)
+        output = output.transpose(0, 1)  # Обратно к (batch_size, seq_length, embeddings_size)
+        output = self.final_layer(output) + embeddings.transpose(0, 1)  # Residual connection
+        print("Output: ", output.shape)
+
+        return output
+'''
 
 class MyTransformer(nn.Module):
     def __init__(self, embeddings_size, vocabulary_size, heads_count=3):
@@ -148,14 +164,13 @@ sentenses = []
 targets_new = []
 all_train_losses = []
 all_val_losses = []
-for text, target in zip(texts[:100], targets[:100]):
+for text, target in zip(texts[:1000], targets[:1000]):
     sentenses_ = split_into_sentences(text)
     sentenses.extend(sentenses_)
     targets_new.extend([target] * len(sentenses_))
 print(targets_new)
 print(len(sentenses))
 print(len(targets_new))
-input()
 target_names = news_dataset.target_names
 
 class MyDataset(Dataset):
@@ -163,22 +178,21 @@ class MyDataset(Dataset):
         self.titles = np.array(texts)
         self.outputs = torch.tensor(targets, dtype=torch.long)  # Индексы классов
         self.tokens = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(sentense)) for sentense in self.titles]
+        print(sum([len(g) for g in self.tokens]) / len(self.tokens))
         if max_length == -1:
             max_length = max([len(token) for token in self.tokens])
         print("Max length: ", max_length)
         for i in range(len(self.tokens)):
             current_length = len(self.tokens[i])
             self.tokens[i] = self.tokens[i] + [0 for _ in range(max_length - current_length)]
-        self.tokens = torch.tensor(np.array(self.tokens), dtype=torch.int32)
         print("Dataset size: ", self.__len__())
-        print("Tokens: ", self.tokens.shape)
         print("Outputs: ", self.outputs.shape)
 
     def __len__(self):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        tokens_list = self.tokens[idx]
+        tokens_list = torch.tensor(self.tokens[idx], dtype=torch.int32)
         return tokens_list, self.outputs[idx]
     
 train_texts, val_texts, train_outputs, val_outputs = train_test_split(sentenses, targets_new, test_size=0.15, random_state=52)
@@ -223,6 +237,6 @@ def go_epochs(epochs, model, train_dataset_loader, val_dataset_loader, optimizer
 # print(tokens)  # ['i', 'love', 'cats']
 # print(ids)     # [1045, 2293, 4012]
 
-my_trans = MyTransformer(128, vocab_size, 3)
+my_trans = MyTransformer(129, vocab_size, 3)
 optimizer = optim.Adam(my_trans.parameters(), lr=0.0005, weight_decay=0.0001)
 output = my_trans(torch.tensor([tokenizer.convert_tokens_to_ids(tokenizer.tokenize("I suck big penises with gachi guys"))]))
